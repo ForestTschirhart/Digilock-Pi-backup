@@ -2,7 +2,7 @@ from digilock_remote import Digilock_UI
 from digilock_remote import Command_type
 import matplotlib.pyplot as plt
 
-dui = Digilock_UI("10.9.114.193", 60001)
+dui = Digilock_UI("192.168.10.3", 60002)
 
 for command in dui.commandset:
     if command.settable:
@@ -16,4 +16,14 @@ for command in dui.commandset:
             print('{command.name}={value}'.format(command=command, value=dui.query_numeric(command)))
         if command.type == Command_type.Bool:
             print('{command.name}={value}'.format(command=command, value=dui.query_bool(command)))
+
+print()
+cur_gain = dui.query_numeric('pid1:gain')
+print(cur_gain)
+dui.set_numeric('pid1:gain', 21)
+cur_gain = dui.query_numeric('pid1:gain')
+print(cur_gain)
+
+
+
 dui.close()

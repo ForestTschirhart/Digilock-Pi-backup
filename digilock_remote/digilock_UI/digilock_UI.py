@@ -1,152 +1,122 @@
-import telnetlib
-from typing import List, Dict, Union
+import telnetlib3
 import numpy as np
-from enum import Enum
+import re
+import time
 
-from command import Command, digilockUI_commands, Command_type
+TIMEOUT = 3 # seconds to wait for responses before concluding something is wrong or moving on
 
 class Digilock_UI:
-    def __init__(self, host: str, port: int, commandset:List[Command] = None):
+    def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
-        self.tn = telnetlib.Telnet(host, port)
-        self.tn.read_until(b"> ", timeout=10) # wait to first prompt
-        if commandset:
-            self.commandset = commandset
+
+        MAX_RETRIES = 5
+
+        for attempt in range(MAX_RETRIES):
+            print(f"Connecting to {self.host}:{self.port} (attempt {attempt+1}/{MAX_RETRIES})...")
+            try:
+                self.tn = telnetlib3.Telnet(host, port, timeout=5)
+                resp = self.tn.read_until(b"> ", timeout=10)
+                if resp.strip():
+                    print("Connected successfully!")
+                    break
+            except Exception as e:
+                print(f"Telnet connection failed: {e}")
+            time.sleep(2)
         else:
-            self.commandset = digilockUI_commands
-    
+            raise ConnectionError(f"Failed to connect to {self.host}:{self.port} after {MAX_RETRIES} attempts")
+        
+        #print(self.tn.read_until(b"> ", timeout=10).split(b'\r')[2].decode('ascii')) # wait to first prompt
+        print('-----------------------------------------------')
+        print()
+        
+        
     def close (self) -> None:
         self.tn.close()
-
-    def get_command_info(self, command: str) -> Command:
-        coms = [com for com in self.commandset if com.name == command]
-        if coms:
-            return coms[0]
-        else:
-            return None
         
-    def query_lines(self, command: str) -> List[str]:
+    def query_lines(self, command: str) -> str: # functional block that separates good data from chaff
         self.tn.write((command+"?").encode('ascii')+b"\n")
-        return_str = self.tn.read_until(b"> ", timeout=1).decode('ascii')
-        splitted_str = return_str.split('\n')
-        del splitted_str[-1]
-        del splitted_str[0]
-        splitted_str[0] = splitted_str[0].split('=')[1]
-        return splitted_str
+        return_str = self.tn.read_until(b"> ", timeout=TIMEOUT).decode('ascii')
+        if not return_str: 
+            raise RuntimeError(command + ": NO RESPONSE")
+        if 'Error' in return_str: # makes incorrect commands a little more transparent
+            raise TypeError(f'[{command}] is unknown command')
+        
+        split_str = return_str.split('=')[-1] # get rid of all echo
+        split_str = split_str.split('\r')[0] # get rid of trailing stuff
+        return split_str
 
-    def query_numeric(self, command: Union[str, Command]) -> float:
-        if isinstance(command, Command):
-            com = command
-        else: # command is a str
-            com = self.get_command_info(command)
-
-        if com:
-            if com.type == Command_type.Numeric:
-                line = self.query_lines(com.name)
-                return float(line[0])
-            else: # query a non numeric command, always return NaN
-                return np.nan
+    def query_numeric(self, command: str) -> float:
+        line = self.query_lines(command)
+        if 'm' in line: # some of the DUIs use a.u. some return actual values with order of mag suffix
+            mult = 1e-3
+        elif 'u' in line:
+            mult = 1e-6
+        elif 'n' in line:
+            mult = 1e-9
         else:
-            line = self.query_lines(command)
-            return float(line[0])
+            mult = 1
+        cleaned = re.sub(r'[^0-9+.\-]', '', line) # get rid of all non numeric chars
+        return float(cleaned) * mult
 
     def query_range(self, command: str) -> str:
         line = self.query_lines(command+'.range')
-        return line[0].strip()
+        return line.strip()
 
-    def query_enum(self, command:  Union[str, Command]) -> str:
-        if isinstance(command, Command):
-            com = command
-        else: # command is a str
-            com = self.get_command_info(command)
-
-        if com:
-            line = self.query_lines(com.name)
-            value = line[0].strip()
-            if com.enum_type !=None:
-                items = [item for item in com.enum_type if item.value == value]
-                if items:
-                    return items[0] # should only one matched
-        else:
-            line = self.query_lines(command)
-            value = line[0].strip()
-            return value
-
+    def query_enum(self, command: str) -> str:
+        line = self.query_lines(command)
+        return line.strip()
     
-    def query_bool(self, command:  Union[str, Command]) -> bool:
-        if isinstance(command, Command):
-            com = command
-        else: # command is a str
-            com = self.get_command_info(command)
+    def query_bool(self, command:  str) -> bool:
+        line = self.query_lines(command)
+        return line.strip().lower() == "true"
 
-        if com: # valid str to Command lookup
-            if com.type == Command_type.Bool:
-                line = self.query_lines(com.name)
-                return line[0].strip().lower() == "true"
-            else: # query a non bool command, always return False
-                return False
-        else:
-            line = self.query_lines(command)
-            return line[0].strip().lower() == "true"
-
-    def query_graph(self, command:  Union[str, Command]) -> np.ndarray:
-        if isinstance(command, Command):
-            com = command
-        else: # command is a str
-            com = self.get_command_info(command)
-        
-        if com:
-            if com.type == Command_type.Graph:
-                lines = self.query_lines(command)
-                nums = lines[0].split()
-                data = np.ndarray((len(lines), len(nums)))
-                for count, line in enumerate(lines):
-                    line_num = np.fromstring(line, sep=' ')
-                    data[count] = line_num
-                return data
-        
-        return np.ndarray((0,0))
+    def query_graph(self, command: str) -> str: # functional block that separates good data from chaff
+        self.tn.write((command+"?").encode('ascii')+b"\n")
+        return_str = self.tn.read_until(b"> ", timeout=TIMEOUT).decode('ascii')
+        if not return_str: 
+            raise RuntimeError(command + ": NO RESPONSE")
+        if 'Error' in return_str: # makes incorrect commands a little more transparent
+            raise TypeError(f'[{command}] is unknown command')
+        data_str = return_str.split('=')[1]
+        data_str = data_str.split('\r\n')[:-1]
+        data_list = []
+        for i in range(len(data_str)):
+            data_list.append([float(s) for s in data_str[i].split('\t')])
+        data_array = np.array(data_list)
+        #t = data_array[:,0]
+        ch1 = data_array[:,1] #skip 2 cause its a redundant time array
+        ch2 = data_array[:,3]
+        #return t, ch1, ch2
+        return ch1, ch2
 
     def send_comand(self, command: str) -> None :
         self.tn.write(command.encode('ascii')+b"\n")
-        self.tn.read_until(b"> ", timeout=1)
+        return_str = self.tn.read_until(b"> ", timeout=TIMEOUT).decode('ascii')
+        if not return_str:
+            raise RuntimeError(command + ": NO RESPONSE")
+        if "Error" in return_str:
+            if "bad command" in return_str:
+                err_msg = f"ERROR: [{command}] is unknown command"
+            elif "bad parameter" in return_str:
+                err_msg = f"ERROR: [{command}] has bad parameter"
+            elif "value out of range" in return_str:
+                err_msg = f"ERROR: [{command}] parameter is out of range"
+            else:
+                err_msg = f"ERROR: [{command}] is read only command"
+            raise TypeError(err_msg)
 
-    def set_numeric(self, command: Union[str, Command], value: float) -> None:
-        if isinstance(command, Command):
-            com = command
-        else: # command is a str
-            com = self.get_command_info(command)
-        
-        if com:
-            if com.type == Command_type.Numeric:
-                self.send_comand(com.name+"={}".format(value))
-        else:
-            self.send_comand(command+"={}".format(value))
+
+    def set_numeric(self, command: str, value: float) -> None:
+        self.send_comand(command+"={}".format(value))
     
-    def set_bool(self, command: Union[str, Command], value: bool) -> None:
-        if isinstance(command, Command):
-            com = command
-        else: # command is a str
-            com = self.get_command_info(command)
-
-        tf = "{}".format(value).lower()
-        if com:
-            if com.type == Command_type.Bool:
-                self.send_comand(com.name+"="+tf)
+    def set_bool(self, command: str, value: bool) -> None:
+        if bool:
+            tf='true'
         else:
-            self.send_comand(command+"="+tf)
+            tf='false'
+        self.send_comand(command+"="+tf)
 
-    def set_enum(self, command: str, item: Enum) -> None:
-        if isinstance(command, Command):
-            com = command
-        else: # command is a str
-            com = self.get_command_info(command)
-        
-        value = "{}".format(item.value)
-        if com:
-            if com.type == Command_type.Enum and isinstance(item, com.enum_type):
-                self.send_comand(com.name+"="+value)
-        else:
-            self.send_comand(command+"="+value)
+    def set_enum(self, command: str, item: str) -> None:   
+        self.send_comand(command+"="+item)
         
