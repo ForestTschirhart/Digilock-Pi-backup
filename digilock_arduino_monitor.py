@@ -75,17 +75,6 @@ GLOB_DICT = {        'blue happy': None,
 app = FastAPI() # pi's server
 DASH_URL = "http://10.155.94.105:8050" # dash's server
 
-def push_to_dash():
-    try:
-        #ard peaks and dac query
-        ard_mon.get_ard_log_info()
-        
-        with push_2dash_lock:
-            requests.post(f"{DASH_URL}/api/digilock_state_change", json=GLOB_DICT, timeout=2) # don't need a dict lock here cause reads are safe, also avoids potential deadlock bug
-        
-        print(f'pushed to dash!')
-    except Exception as e:
-        print(f'frik >:(  {e}' )
 
 
 
@@ -146,7 +135,7 @@ class DUIMonitor:
                 new_state = [self.locked, self.lock_happy]
                 if (new_state != self.prev_state):
                     self.prev_state = new_state
-                    push_to_dash() # to be modded later
+                    get_state_push_dash() # to be modded later
                                 
                 tf=time.perf_counter()
                 wait = (1/self.f_samp) - (tf-ti)
@@ -201,9 +190,60 @@ def get_scopes():
         raise HTTPException(status_code=500, detail=f"Scope Retrieval Failed: {e}")
     
 
+@app.post('/set_cur_ctrl')
+def set_cur_ctrl(setting: dict = Body(...)):
+    try:
+        if setting['laser'] == 'blue':
+            dui_blue.cur_ctrl_en = setting['value']
+        elif setting['laser'] == 'green':
+            dui_green.cur_ctrl_en = setting['value']
+        else:
+            raise ValueError('laser name invalid')
+    except Exception as e:
+        return HTTPException(status_code=500, detail=f'Current ctrl set failed: {e}')
+
+
+
+@app.get('/init_monitor_params') 
+def init_digi_monitor_params(laser: str = Query(...)):
+    try:
+        if laser == 'green':
+            device = dui_green
+        elif laser=='blue':
+            device = dui_blue
+        else:
+            raise ValueError('laser name invalid')
+        rms_avg_thresh = device.rms_avg_thresh
+        window_len = device.window_len
+        return {
+            "rms avg threshold": rms_avg_thresh,
+            "window length": window_len
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f'Monitor param retrieval failed: {e}')
+
+
+@app.post("/refresh_params")
+def set_digi_lock_params(params: dict = Body(...)):
+    ''' params format: { name: str(green / blue)
+                         window length: int
+                         rms threshold: float
+                         fill fraction threshold: float
+                        }
+    '''
+    
+    try:
+        device = dui_green if params['name'] == "green" else dui_blue
+        device.refresh_params(params['rms avg threshold'],
+                              params['window length'])
         
-        
-        
+        #return {"status": "ok"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Parameter Refresh Failed: {e}")
+
+
+
+
 ### -------------------------------------- Arduino Stuff ----------------------------------- ###        
         
 class ArduinoMonitor:
@@ -283,7 +323,7 @@ class ArduinoMonitor:
                 
                 if new_state != self.prev_state:
                     self.prev_state = new_state
-                    push_to_dash()
+                    get_state_push_dash()
                 
                 tf=time.perf_counter()
                 wait = (1/self.gpio_samp_rate) - (tf-ti)
@@ -296,11 +336,14 @@ class ArduinoMonitor:
                 print(f"[Arduino gpio monitor loop error] {e}")
                 time.sleep(2)
         
+        
     def push_flag(self, pin, hilo):
         GPIO.output(pin, hilo)
         
+        
     def pull_flag(self, pin):
         return GPIO.input(pin) == GPIO.HIGH
+    
     
     def get_trace(self, N=500): 
         try: 
@@ -316,6 +359,7 @@ class ArduinoMonitor:
         except Exception as e:
             print('Arduino trace fetch failed: {e}')
             raise RuntimeError('Failed to query arduino log info') from e 
+    
     
     def get_ard_log_info(self):
         try:  
@@ -338,6 +382,7 @@ class ArduinoMonitor:
             print('Failed to query arduino log info')
             raise RuntimeError('Failed to query arduino log info') from e        
     
+    
     def query_params(self):
         try:
             with serial_lock:
@@ -356,6 +401,7 @@ class ArduinoMonitor:
         except Exception as e:
             print(f'Failed to query arduino params {e}')
             raise RuntimeError(f'Failed to query arduino params {e}') from e
+    
     
     def refresh_params(self, trigger_holdoff:int, samp_ct:int, dac_start:int, dac_min:int,
                        long_mem_n_stdev:float, short_mem_n_stdev:float, short_mem_len:int):
@@ -381,6 +427,7 @@ class ArduinoMonitor:
             print(f'Failed to Set Arduino Params: {e}')
             raise RuntimeError(f'Failed to Set Arduino Params: {e}') from e
     
+    
     def init_stats(self):
         try:
             with serial_lock:
@@ -398,6 +445,7 @@ class ArduinoMonitor:
             print(f'Failed to init arduino stats {e}')
             raise RuntimeError('Failed to init arduino stats') from e
         
+        
     def reset_feedback(self):
         try:
             self.fbk_en = False # disable feedback, arduino manually does this but push to pin just in case
@@ -411,6 +459,7 @@ class ArduinoMonitor:
             print(f'Failed to Reset Arduino Feedback: {e}')
             raise RuntimeError(f'Failed to Reset Arduino Feedback: {e}') from e
 
+
 @app.get("/arduino_trace", response_class=ORJSONResponse)
 def get_arduino_trace():
     try:
@@ -423,6 +472,7 @@ def get_arduino_trace():
         print(f"Arduino Trace Retrieval Failed: {e}")
         raise HTTPException(status_code=500, detail=f"Arduino Trace Retrieval Failed: {e}")
 
+
 @app.post("/reset_ard_fbk")
 def reset_ard_feedback():
     try:
@@ -432,68 +482,14 @@ def reset_ard_feedback():
         raise HTTPException(status_code=500, detail=f"Arduino Feedback Reset Failed: {e}")
 
 
-### ------------------------------------------- Shared Structures ------------------------------------ ###
-
-
-dui_blue = None # janky global variable fix for startup_event function variable scope issue
-dui_green = None
-ard_mon = None
-
-@app.on_event("startup")
-def startup_event():
-    global dui_blue, dui_green, ard_mon
-    # Create the DUIMonitor instances once at startup
-    dui_blue = DUIMonitor('blue', "192.168.10.3", 60001, F_SAMP, WINDOW_LEN_B, RMS_THRESH_B)
-    dui_green = DUIMonitor('green', "192.168.10.3", 60002, F_SAMP, WINDOW_LEN_G, RMS_THRESH_G)
-    ard_mon = ArduinoMonitor('/dev/ttyACM0', 250000, 4,
-                             MOD_EN_PIN, LOCK_STATE_PIN,
-                             MOD_ACTIVE_PIN, MOD_FAILURE_PIN, PEAKS_LOST_PIN) 
-    
-    # Start their background monitor threads
-    threading.Thread(target=dui_blue.simple_monitor_loop, daemon=True).start()
-    threading.Thread(target=dui_green.simple_monitor_loop, daemon=True).start()
-    threading.Thread(target=ard_mon.gpio_mon_loop, daemon=True).start()
-    time.sleep(5)
-    push_to_dash()
-
-@app.post('/set_cur_ctrl')
-def set_cur_ctrl(setting: dict = Body(...)):
-    try:
-        if setting['laser'] == 'blue':
-            dui_blue.cur_ctrl_en = setting['value']
-        elif setting['laser'] == 'green':
-            dui_green.cur_ctrl_en = setting['value']
-        else:
-            raise ValueError('laser name invalid')
-    except Exception as e:
-        return HTTPException(status_code=500, detail=f'Current ctrl set failed: {e}')
-
 @app.post('/set_ard_fbk')
-def set_ard_fb(setting: bool = Body(...)):
+def set_ard_fbk_en(setting: bool = Body(...)):
     try:
         ard_mon.fbk_en = setting
         print(f'{setting}={type(setting)}')
     except Exception as e:
         raise HTTPException(status_code=500, detail=f'Arduino FB set failed: {e}')
 
-
-@app.get('/init_monitor_params') 
-def init_monitor_params(laser: str = Query(...)):
-    try:
-        if laser == 'green':
-            device = dui_green
-        elif laser=='blue':
-            device = dui_blue
-        else:
-            raise ValueError('laser name invalid')
-        rms_avg_thresh = device.rms_avg_thresh
-        window_len = device.window_len
-        return {
-            "rms avg threshold": rms_avg_thresh,
-            "window length": window_len
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f'Monitor param retrieval failed: {e}')
 
 @app.get('/init_arduino_params')
 def init_arduino_params():
@@ -512,25 +508,6 @@ def init_arduino_params():
     except Exception as e:
         print(f'Arduino param retrieval failed: {e}')
         raise HTTPException(status_code=500, detail=f'Arduino param retrieval failed: {e}')
-
-
-@app.post("/refresh_params")
-def set_lock_params(params: dict = Body(...)):
-    ''' params format: { name: str(green / blue)
-                         window length: int
-                         rms threshold: float
-                         fill fraction threshold: float
-                        }
-    '''
-    
-    try:
-        device = dui_green if params['name'] == "green" else dui_blue
-        device.refresh_params(params['rms avg threshold'],
-                              params['window length'])
-        
-        #return {"status": "ok"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Parameter Refresh Failed: {e}")
    
 
 @app.post("/refresh_arduino_params")
@@ -563,6 +540,58 @@ def initialize_arduino_stats():
         print(f'Arduino init stats failed: {e}')
         raise HTTPException(status_code=500, detail=f'Arduino init stats failed: {e}')
     
+
+
+
+### ------------------------------------------- Shared Structures ------------------------------------ ###
+
+
+dui_blue = None # janky global variable fix for startup_event function variable scope issue
+dui_green = None
+ard_mon = None
+
+
+def get_state_push_dash():
+    try:
+        #ard peaks and dac query
+        ard_mon.get_ard_log_info()
+        
+        with push_2dash_lock:
+            requests.post(f"{DASH_URL}/api/master_pi_state_report", json=GLOB_DICT, timeout=2) # don't need a dict lock here cause reads are safe, also avoids potential deadlock bug
+        
+        print(f'pushed to dash!')
+    except Exception as e:
+        print(f'frik >:(  {e}' )
+        
+
+@app.on_event("startup")
+def startup_event():
+    global dui_blue, dui_green, ard_mon
+    # Create the DUIMonitor instances once at startup
+    dui_blue = DUIMonitor('blue', "192.168.10.3", 60001, F_SAMP, WINDOW_LEN_B, RMS_THRESH_B)
+    dui_green = DUIMonitor('green', "192.168.10.3", 60002, F_SAMP, WINDOW_LEN_G, RMS_THRESH_G)
+    ard_mon = ArduinoMonitor('/dev/ttyACM0', 250000, 4,
+                             MOD_EN_PIN, LOCK_STATE_PIN,
+                             MOD_ACTIVE_PIN, MOD_FAILURE_PIN, PEAKS_LOST_PIN) 
+    
+    # Start their background monitor threads
+    threading.Thread(target=dui_blue.simple_monitor_loop, daemon=True).start()
+    threading.Thread(target=dui_green.simple_monitor_loop, daemon=True).start()
+    threading.Thread(target=ard_mon.gpio_mon_loop, daemon=True).start()
+    time.sleep(5)
+    get_state_push_dash()
+
+
+@app.post("/trigger_state_report")
+def trigger_state_report():
+    try:
+        get_state_push_dash()
+    except Exception as e:
+        print(f'Trigger_state_report failed: {e}')
+        raise HTTPException(status_code=500, detail=f'Trigger_state_report failed: {e}')
+    
+
+
 
 if __name__ == '__main__':
     
