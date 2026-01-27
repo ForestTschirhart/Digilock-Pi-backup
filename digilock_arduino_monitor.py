@@ -33,71 +33,81 @@ wouldBcool = ['scope:graph']
 
 # defualt init vars for the rms monitors
 
-RMS_THRESH_G = 10
+RMS_THRESH_G = 100
 RMS_THRESH_B = 80
 WINDOW_LEN_G = 20
 WINDOW_LEN_B = 20
 F_SAMP = 2 #Hz for the RMS loops
 
 # GPIO State pins for the arduino connection
+PEAKS_LOST_PIN = 38 
 MOD_FAILURE_PIN = 29
 MOD_ACTIVE_PIN = 31
 MOD_EN_PIN = 33
 LOCK_STATE_PIN = 35
-PEAKS_LOST_PIN = 38 
 
-
+ARD_INIT_STATS_TO = 10 # sec
 N = 500 # arduino trace length
 
 
-glob_dict_lock = threading.Lock() # for different classes modifying the same dict or 
+glob_dict_lock = threading.Lock() # for different classes modifying the same dict 
 tcp_lock = threading.Lock() # for interfacing with the digilock RCI over using tcp
-push_2dash_lock = threading.Lock() # for talking to the dash from inside a thread
+serial_lock = threading.Lock() # for communitication over serial with the Arduino from in/out of a thread
+push_2dash_lock = threading.Lock() # for PUSHING to the dash from inside a thread
 
-# Will need this in the future if we want multiple possible feedback sources (rms based vs. arduino)
-GLOB_DICT = {'blue_happy': None,
-             'blue_locked': None,
-             'blue_rms_fb_active': None,
-             'green_happy': None,
-             'green_locked': None,
-             'green_rms_fb_active': None,
-             'ard_peaks': None,
-             'ard_fb_active' : None,
-             'ard_fb_failure': None,
-             }
+# shared state variables 
+GLOB_DICT = {        'blue happy': None,
+                     'blue locked': None,
+                     'blue rms': None,
+                     'blue mean': None,
+                     'green happy': None,
+                     'green locked': None,
+                     'green rms': None,
+                     'green mean': None,
+                     'ard peaks happy': None,
+                     'ard fbk active' : None,
+                     'ard fbk failed': None,
+                     'ard peaks mean': None,
+                     'ard peaks stdev': None,
+                     'ard dac': None
+                    }
 
-
-DASH_URL = "http://10.155.94.105:8050" # for pushing to the dash
+app = FastAPI() # pi's server
+DASH_URL = "http://10.155.94.105:8050" # dash's server
 
 def push_to_dash():
     try:
-        r = requests.get(f"{DASH_URL}/api/digi_feedback_status", timeout=2)
-        if r.ok:
-            status1 = r.json().get("test1", False)
-            status2 = r.json().get("test2", False)
-        print(f'pushed to dash: {status1} {status2}')
+        #ard peaks and dac query
+        ard_mon.get_ard_log_info()
+        
+        with push_2dash_lock:
+            requests.post(f"{DASH_URL}/api/digilock_state_change", json=GLOB_DICT, timeout=2) # don't need a dict lock here cause reads are safe, also avoids potential deadlock bug
+        
+        print(f'pushed to dash!')
     except Exception as e:
         print(f'frik >:(  {e}' )
 
 
+
+### ---------------------------------------- RMS Monitor----------------------------------------- ###
+
 class DUIMonitor:
-    def __init__(self, name, ip, port, f_samp, window_len, rms_thresh, fill_frac_thresh, trace_downsamp_factor=10):
+    def __init__(self, name, ip, port, f_samp, window_len, rms_avg_thresh, trace_downsamp_factor=10):
         self.name = name
         print(name)
         self.dui = Digilock_UI(ip, port)
         print()
         
         self.locked = False 
-        self.lock_unhappy = False
-        self.prev_state = [self.locked, self.lock_unhappy]
+        self.lock_happy = False
+        self.prev_state = [self.locked, self.lock_happy]
         
         self.std = None
         self.mean = None
         
         self.window_len = window_len
-        self.rms_thresh = rms_thresh
-        self.sum_thresh = int(window_len*fill_frac_thresh)
-        self.running_window = np.zeros(window_len, dtype=bool) # for dynamic size edit outside of here
+        self.rms_avg_thresh = rms_avg_thresh
+        self.running_window = np.zeros(window_len, dtype=float) # for dynamic size edit outside of here
         
         self.f_samp = f_samp
         self.cur_ctrl_en = False
@@ -111,6 +121,7 @@ class DUIMonitor:
         while True:
             try:              
                 ti=time.perf_counter()
+                
                 with tcp_lock:
                     self.rms = self.dui.query_numeric('scope:ch2:rms')
                     self.mean = self.dui.query_numeric('scope:ch1:mean')
@@ -118,59 +129,48 @@ class DUIMonitor:
                 
                 with self.thread_lock:
                     self.running_window[1:] = self.running_window[:-1] #bitshift
-                    self.running_window[0] = self.rms > self.rms_thresh # add new bit to front of sliding window 
-                    self.lock_unhappy = np.sum(self.running_window) >= self.sum_thresh
+                    self.running_window[0] = self.rms # add new rms to front of sliding window 
+                    self.lock_happy = np.mean(self.running_window) <= self.rms_avg_thresh
+                
+                with glob_dict_lock:
+                    GLOB_DICT[f"{self.name} happy"] = bool(self.lock_happy)
+                    GLOB_DICT[f"{self.name} locked"] = bool(self.locked)
+                    GLOB_DICT[f"{self.name} rms"] = self.rms
+                    GLOB_DICT[f"{self.name} mean"] = self.mean
                 
                 # just for rms controlled feedback, now maybe defunct
-                if self.lock_unhappy and self.locked and self.cur_ctrl_en:  # set up for current bump 
+                if not self.lock_happy and self.locked and self.cur_ctrl_en:  # set up for current bump 
                     self.trigger_current_bump()
                 
                 # for state change push (logging)
-                new_state = [self.locked, self.lock_unhappy]
+                new_state = [self.locked, self.lock_happy]
                 if (new_state != self.prev_state):
                     self.prev_state = new_state
-                    push_to_dash(new_state) # to be modded later
+                    push_to_dash() # to be modded later
                                 
                 tf=time.perf_counter()
                 wait = (1/self.f_samp) - (tf-ti)
                 if wait > 0:
                     time.sleep(wait)
                 else:
-                    print(f"LOOP LAGGING DESIRED F_SAMP by: {-1*wait} ms")
+                    print(f"{self.name} DIGILOCK LOOP LAGGING DESIRED F_SAMP by: {-1*wait} s")
         
             except Exception as e:
-                print(f"[{self.name} monitor error] {e}")
+                print(f"[{self.name} monitor loop error] {e}")
                 time.sleep(2)
                 
     
     def trigger_current_bump(self):
-        # self.locked = self.dui.query_bool('pid2:lock:state') MAKE SURE WERE LOCKED BEFORE TRYING THIS CURRENT BUMP
-        # safe loop inc = 0 
-        #while safe loop inc < #:
-            #bump current by (X)
-            #loop to check if rms decreasing
-                # roll and update running window
-                # wait
-            # sum window to see if below thresh
-            # if not:
-                #if we're still within output range
-                    # set (X=bump inc) (loop and bump)
-                # if not
-                    # return current bump failed (deal with how to handle this in the main loop)       
-            # if yes:
-                # set current bump (X=0) (loop but dont bump next time)
-                # set safe_loop_inc += 1
         print('current ctrl on')
         self.cur_ctrl_active = True
     
         
-    def refresh_params(self, rms_thresh: float, window_len: int, fill_thresh: int):
+    def refresh_params(self, rms_avg_thresh: float, window_len: int):
         try:
             with self.thread_lock:
-                self.rms_thresh = rms_thresh
+                self.rms_avg_thresh = rms_avg_thresh
                 self.window_len = window_len
-                self.sum_thresh = fill_thresh
-                self.running_window = np.zeros(window_len, dtype=bool) # this is the one  that needs a lock (not atomic)
+                self.running_window = np.zeros(window_len, dtype=float) # this is the one  that needs a lock (not atomic)
             #return [self.rms_thresh, self.window_len, fill_frac_thresh]
         except Exception as e:
             raise RuntimeError('Failed to Set Params') from e
@@ -184,124 +184,6 @@ class DUIMonitor:
         except Exception as e:
             print(f'{self.name} digilock trace fetch error: {e}')
             raise RuntimeError(f'{self.name} digilock trace fetch error') from e
-          
-        
-class ArduinoMonitor:
-    def __init__(self, serial_port, baud,
-                 push_fbk_en_pin, push_digilock_status_pin,
-                 pull_fbk_active_pin, pull_fbk_failure_pin, pull_peaks_lost_pin):
-        
-        try: 
-            self.ser = serial.Serial(serial_port, baud, timeout=2)
-            print("Arduino Connected!")
-            time.sleep(0.5)  # Let serial port establish
-            self.ser.reset_input_buffer()  # Clear arduino first time loop initialization message
-                
-        except Exception as e:
-            print("Failed to open arduino serial port:", e)  
-        
-        self.thread_lock = threading.Lock()
-        
-        
-        self.push_fbk_en_pin = push_fbk_en_pin
-        self.push_digilock_status_pin = push_digilock_status_pin
-        self.pull_fbk_active_pin = pull_fbk_active_pin
-        self.pull_fbk_failure_pin = pull_fbk_failure_pin
-        self.pull_peaks_lost_pin = pull_peaks_lost_pin
-        GPIO.setup([push_fbk_en_pin, push_digilock_status_pin], GPIO.OUT, initial=GPIO.LOW)
-        GPIO.setup([pull_fbk_active_pin, pull_fbk_failure_pin, pull_peaks_lost_pin], GPIO.IN)
-        
-        # get params from arduino when pi script boots
-        
-        self.trigger_delay = None
-        self.samp_ct = None
-        
-        self.query_params() # initializes params in group just above^
-        
-    def push_flag(self, pin, hilo):
-        GPIO.output(pin, hilo)
-        
-    def pull_flag(self, pin):
-        return GPIO.input(pin) == GPIO.HIGH
-    
-    def get_trace(self, N=500):
-        self.ser.write(b'T\n')
-        self.ser.flush()
-        
-        time.sleep(0.01)
-    
-    # Read EVERYTHING currently in buffer
-        total_bytes = self.ser.in_waiting
-        print(f"Arduino sent {total_bytes} bytes")
-        
-        raw = self.ser.read(N*2)
-        
-        return np.frombuffer(raw, dtype='<u2').astype(np.int32)
-    
-    def query_params(self):
-        try:
-            with self.thread_lock:
-                self.ser.write(b'P\n')
-                resp = self.ser.readline()
-                resp = resp.decode('ascii').rstrip().split(",")
-                self.trigger_delay = resp[0]
-                self.samp_ct = resp[1]
-        except Exception as e:
-            print('Failed to query arduino params')
-            raise RuntimeError('Failed to query arduino params') from e
-    
-    def refresh_params(self, trigger_delay: float, samp_ct: int):
-        try:
-            with self.thread_lock:
-                self.ser.write(f'D{trigger_delay}\n'.encode('ascii'))
-                resp = self.ser.readline()
-                print(resp)
-                self.trigger_delay = trigger_delay
-                
-                
-                self.ser.write(f'C{samp_ct}\n'.encode('ascii'))
-                self.samp_ct = samp_ct
-                print(samp_ct)
-                
-        except Exception as e:
-            print('Failed to Set Arduino Params')
-            raise RuntimeError('Failed to Set Arduino Params') from e
-
-        
-app = FastAPI()
-
-dui_blue = None # janky global variable fix for startup_event function variable scope issue
-dui_green = None
-ard_mon = None
-
-@app.on_event("startup")
-def startup_event():
-    global dui_blue, dui_green, ard_mon
-    # Create the DUIMonitor instances once at startup
-    dui_blue = DUIMonitor('Blue', "192.168.10.3", 60001, F_SAMP, WINDOW_LEN_B, RMS_THRESH_B, fill_frac_thresh=0.75)
-    dui_green = DUIMonitor('Green', "192.168.10.3", 60002, F_SAMP, WINDOW_LEN_G, RMS_THRESH_G, fill_frac_thresh=0.75)
-    ard_mon = ArduinoMonitor('/dev/ttyACM0', 250000,
-                             MOD_EN_PIN, LOCK_STATE_PIN,
-                             MOD_ACTIVE_PIN, MOD_FAILURE_PIN, PEAKS_LOST_PIN) 
-    
-    # Start their background monitor threads
-    threading.Thread(target=dui_blue.simple_monitor_loop, daemon=True).start()
-    threading.Thread(target=dui_green.simple_monitor_loop, daemon=True).start()
-    
-    time.sleep(5)
-    push_to_dash()
-
-@app.post('/set_cur_ctrl')
-def set_cur_ctrl(setting: dict = Body(...)):
-    try:
-        if setting['laser'] == 'blue':
-            dui_blue.cur_ctrl_en = setting['value']
-        elif setting['laser'] == 'green':
-            dui_green.cur_ctrl_en = setting['value']
-        else:
-            raise ValueError('laser name invalid')
-    except Exception as e:
-        return HTTPException(status_code=500, detail=f'Current ctrl set failed: {e}')
 
 
 @app.get("/digi_scope_traces", response_class=ORJSONResponse)
@@ -317,14 +199,222 @@ def get_scopes():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Scope Retrieval Failed: {e}")
+    
 
+        
+        
+        
+### -------------------------------------- Arduino Stuff ----------------------------------- ###        
+        
+class ArduinoMonitor:
+    def __init__(self, serial_port, baud, gpio_samp_rate,
+                 push_fbk_en_pin, push_digilock_status_pin,
+                 pull_fbk_active_pin, pull_fbk_failure_pin, pull_peaks_lost_pin):
+        
+        try: 
+            self.ser = serial.Serial(serial_port, baud, timeout=2)
+            print("Arduino Connected!")
+            print("---------------------------")
+            print()
+            time.sleep(0.5)  # Let serial port establish
+            self.ser.reset_input_buffer()  # Clear arduino first time loop initialization message
+                
+        except Exception as e:
+            print("Failed to open arduino serial port:", e)       
+        
+        self.push_fbk_en_pin = push_fbk_en_pin
+        self.push_digilock_status_pin = push_digilock_status_pin
+        self.pull_fbk_active_pin = pull_fbk_active_pin
+        self.pull_fbk_failure_pin = pull_fbk_failure_pin
+        self.pull_peaks_lost_pin = pull_peaks_lost_pin
+        GPIO.setup([push_fbk_en_pin, push_digilock_status_pin], GPIO.OUT, initial=GPIO.LOW)
+        GPIO.setup([pull_fbk_active_pin, pull_fbk_failure_pin, pull_peaks_lost_pin], GPIO.IN)
+        
+        # get params from arduino when pi script boots
+        
+        self.trigger_holdoff = None
+        self.samp_ct = None
+        self.dac_start_val = None
+        self.dac_min_val = None
+        self.long_mem_n_stdev = None
+        self.short_mem_n_stdev = None
+        self.short_mem_len = None
+        
+        self.query_params() # initializes params in group just above^
+        
+        self.digilock_state = False
+        self.fbk_en = False
+        self.peaks_happy = None        
+        self.fbk_active = None
+        self.fbk_failed = None
+        self.prev_state = [self.peaks_happy, self.fbk_active, self.fbk_failed]        
+        self.gpio_samp_rate = gpio_samp_rate
+        
+        
+        self.pks_mean = None
+        self.pks_std = None
+        self.dac_lvl = None
+        
+        
+    def gpio_mon_loop(self):
+        while True:
+            try:              
+                ti=time.perf_counter()
+                
+                self.peaks_happy = not self.pull_flag(self.pull_peaks_lost_pin)
+                self.fbk_active = self.pull_flag(self.pull_fbk_active_pin)
+                self.fbk_failed = self.pull_flag(self.pull_fbk_failure_pin)
+                new_state = [self.peaks_happy, self.fbk_active, self.fbk_failed]
+                
+                #print(f"ARD GPIO (happy, active, failed): {self.peaks_happy}, {self.fbk_active}, {self.fbk_failed}")
+                
+                print(type(self.fbk_active), self.fbk_active)
+                
+                
+                with glob_dict_lock:
+                    GLOB_DICT['ard peaks happy'] = bool(self.peaks_happy)
+                    GLOB_DICT['ard fbk active'] = bool(self.fbk_active)
+                    GLOB_DICT['ard fbk failed'] = bool(self.fbk_failed)
+                    self.digilock_state = bool(GLOB_DICT['blue locked'])
+                
+                #give ard lock status pin from blue digilock pi and fbk enable from dash
+                self.push_flag(self.push_digilock_status_pin, self.digilock_state)
+                self.push_flag(self.push_fbk_en_pin, self.fbk_en)
+                
+                if new_state != self.prev_state:
+                    self.prev_state = new_state
+                    push_to_dash()
+                
+                tf=time.perf_counter()
+                wait = (1/self.gpio_samp_rate) - (tf-ti)
+                if wait > 0:
+                    time.sleep(wait)
+                else:
+                    print(f"ARDUINO GPIO MONITOR LOOP LAGGING DESIRED SAMP RATE by: {-1*wait} s")
+                    
+            except Exception as e:
+                print(f"[Arduino gpio monitor loop error] {e}")
+                time.sleep(2)
+        
+    def push_flag(self, pin, hilo):
+        GPIO.output(pin, hilo)
+        
+    def pull_flag(self, pin):
+        return GPIO.input(pin) == GPIO.HIGH
+    
+    def get_trace(self, N=500): 
+        try: 
+            with serial_lock:
+                self.ser.write(b'T\n')
+                self.ser.flush()        
+                time.sleep(0.01)
+                total_bytes = self.ser.in_waiting
+                raw = self.ser.read(N*2) # times 2 is because serial works with 8 bit bytes but we are trying to send over N 16 bit floats
+            
+            print(f"Get Trace: Arduino sent {total_bytes} bytes")
+            return np.frombuffer(raw, dtype='<u2').astype(np.int32)
+        except Exception as e:
+            print('Arduino trace fetch failed: {e}')
+            raise RuntimeError('Failed to query arduino log info') from e 
+    
+    def get_ard_log_info(self):
+        try:  
+            with serial_lock:
+                self.ser.write(b'L\n')
+                self.ser.flush()       
+                resp = self.ser.readline()
+            print(f"Arduino log info: {resp}")
+            resp = resp.decode('ascii').rstrip().split(",")
+            self.pks_mean = float(resp[0])
+            self.pks_std = float(resp[1])
+            self.dac_lvl = int(resp[2])
+            
+            with glob_dict_lock:
+                GLOB_DICT['ard peaks mean'] = self.pks_mean
+                GLOB_DICT['ard peaks stdev'] = self.pks_std
+                GLOB_DICT['ard dac'] = self.dac_lvl                
+            
+        except Exception as e:
+            print('Failed to query arduino log info')
+            raise RuntimeError('Failed to query arduino log info') from e        
+    
+    def query_params(self):
+        try:
+            with serial_lock:
+                self.ser.write(b'P\n')
+                self.ser.flush()
+                resp = self.ser.readline()
+            resp = resp.decode('ascii').rstrip().split(",")
+            self.trigger_holdoff = int(resp[0])
+            self.samp_ct = int(resp[1])
+            self.dac_start_val = int(resp[2])
+            self.dac_min_val = int(resp[3])
+            self.long_mem_n_stdev = float(resp[4])
+            self.short_mem_n_stdev = float(resp[5])
+            self.short_mem_len = int(resp[6])
+            
+        except Exception as e:
+            print(f'Failed to query arduino params {e}')
+            raise RuntimeError(f'Failed to query arduino params {e}') from e
+    
+    def refresh_params(self, trigger_holdoff:int, samp_ct:int, dac_start:int, dac_min:int,
+                       long_mem_n_stdev:float, short_mem_n_stdev:float, short_mem_len:int):
+        try:
+            with serial_lock:
+                self.ser.write(f'R{trigger_holdoff},{samp_ct},{dac_start},{dac_min},{long_mem_n_stdev},{short_mem_n_stdev},{short_mem_len}\n'.encode('ascii'))
+                self.ser.flush()
+                resp = self.ser.readline()
+            resp = resp.decode('ascii').rstrip().split(",")
+            if int(resp[0]) == 1:
+                self.dac_start_val = dac_start # only change if ard said it was valid
+            if int(resp[1]) == 1:
+                self.dac_min_val = dac_min
+            
+            self.trigger_holdoff = trigger_holdoff
+            self.samp_ct = samp_ct
+            self.long_mem_n_stdev = long_mem_n_stdev
+            self.short_mem_n_stdev = short_mem_n_stdev
+            self.short_mem_len = short_mem_len
+        
+            return resp
+        except Exception as e:
+            print(f'Failed to Set Arduino Params: {e}')
+            raise RuntimeError(f'Failed to Set Arduino Params: {e}') from e
+    
+    def init_stats(self):
+        try:
+            with serial_lock:
+                self.ser.write(b'I\n')
+                self.ser.flush()
+                start = time.time()
+                while self.ser.in_waiting == 0:
+                    if time.time() - start > ARD_INIT_STATS_TO:
+                        raise RuntimeError(f"Timeout {ARD_INIT_STATS_TO} sec waiting for serial data")
+                    time.sleep(0.1)
+                resp = self.ser.readline()
+            resp = resp.decode('ascii').rstrip().split(",")
+            return float(resp[0]), float(resp[1])
+        except Exception as e:
+            print(f'Failed to init arduino stats {e}')
+            raise RuntimeError('Failed to init arduino stats') from e
+        
+    def reset_feedback(self):
+        try:
+            self.fbk_en = False # disable feedback, arduino manually does this but push to pin just in case
+            self.push_flag(self.push_fbk_en_pin, self.fbk_en)
+            with serial_lock:
+                self.ser.write(b'F\n')
+                self.ser.flush()
+            print(f"Reset Ard Feedback")
+                
+        except Exception as e:
+            print(f'Failed to Reset Arduino Feedback: {e}')
+            raise RuntimeError(f'Failed to Reset Arduino Feedback: {e}') from e
 
 @app.get("/arduino_trace", response_class=ORJSONResponse)
 def get_arduino_trace():
     try:
-        #with dui_blue.thread_lock:
-        trace = ard_mon.get_trace() # wrap later
-        
+        trace = ard_mon.get_trace()
         return {
             "trace": trace.tolist(),
             "meta" : 0
@@ -333,25 +423,62 @@ def get_arduino_trace():
         print(f"Arduino Trace Retrieval Failed: {e}")
         raise HTTPException(status_code=500, detail=f"Arduino Trace Retrieval Failed: {e}")
 
-
-
-@app.get("/monitor_states", response_class=ORJSONResponse)
-def get_lock_states():
+@app.post("/reset_ard_fbk")
+def reset_ard_feedback():
     try:
-        return {
-            "b_locked": bool(dui_blue.locked),
-            "b_lock_unhappy": bool(dui_blue.lock_unhappy),
-            "g_locked": bool(dui_green.locked),
-            "g_lock_unhappy": bool(dui_green.lock_unhappy),
-            "b_cur_ctrl_active": bool(dui_blue.cur_ctrl_active),
-        }
-
+        ard_mon.reset_feedback()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Monitor State Retrieval Failed: {e}")
+        print(f"Arduino Feedback Reset Failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Arduino Feedback Reset Failed: {e}")
 
 
-@app.get('/monitor_params')
-def get_monitor_params(laser: str = Query(...)):
+### ------------------------------------------- Shared Structures ------------------------------------ ###
+
+
+dui_blue = None # janky global variable fix for startup_event function variable scope issue
+dui_green = None
+ard_mon = None
+
+@app.on_event("startup")
+def startup_event():
+    global dui_blue, dui_green, ard_mon
+    # Create the DUIMonitor instances once at startup
+    dui_blue = DUIMonitor('blue', "192.168.10.3", 60001, F_SAMP, WINDOW_LEN_B, RMS_THRESH_B)
+    dui_green = DUIMonitor('green', "192.168.10.3", 60002, F_SAMP, WINDOW_LEN_G, RMS_THRESH_G)
+    ard_mon = ArduinoMonitor('/dev/ttyACM0', 250000, 4,
+                             MOD_EN_PIN, LOCK_STATE_PIN,
+                             MOD_ACTIVE_PIN, MOD_FAILURE_PIN, PEAKS_LOST_PIN) 
+    
+    # Start their background monitor threads
+    threading.Thread(target=dui_blue.simple_monitor_loop, daemon=True).start()
+    threading.Thread(target=dui_green.simple_monitor_loop, daemon=True).start()
+    threading.Thread(target=ard_mon.gpio_mon_loop, daemon=True).start()
+    time.sleep(5)
+    push_to_dash()
+
+@app.post('/set_cur_ctrl')
+def set_cur_ctrl(setting: dict = Body(...)):
+    try:
+        if setting['laser'] == 'blue':
+            dui_blue.cur_ctrl_en = setting['value']
+        elif setting['laser'] == 'green':
+            dui_green.cur_ctrl_en = setting['value']
+        else:
+            raise ValueError('laser name invalid')
+    except Exception as e:
+        return HTTPException(status_code=500, detail=f'Current ctrl set failed: {e}')
+
+@app.post('/set_ard_fbk')
+def set_ard_fb(setting: bool = Body(...)):
+    try:
+        ard_mon.fbk_en = setting
+        print(f'{setting}={type(setting)}')
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f'Arduino FB set failed: {e}')
+
+
+@app.get('/init_monitor_params') 
+def init_monitor_params(laser: str = Query(...)):
     try:
         if laser == 'green':
             device = dui_green
@@ -359,26 +486,28 @@ def get_monitor_params(laser: str = Query(...)):
             device = dui_blue
         else:
             raise ValueError('laser name invalid')
-        rms_thresh = device.rms_thresh
+        rms_avg_thresh = device.rms_avg_thresh
         window_len = device.window_len
-        sum_thresh = device.sum_thresh
         return {
-            "rms threshold": rms_thresh,
-            "window length": window_len,
-            "sum threshold": sum_thresh
+            "rms avg threshold": rms_avg_thresh,
+            "window length": window_len
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f'Monitor param retrieval failed: {e}')
 
-@app.get('/arduino_params')
-def get_arduino_params():
+@app.get('/init_arduino_params')
+def init_arduino_params():
     try:
-        ard_mon.query_params()
-        trigger_delay = ard_mon.trigger_delay
-        samp_ct = ard_mon.samp_ct
+        ard_mon.query_params() # refreshes the ard_mon object's knowledge of all arduino onboard params        
         return {
-            "trigger delay": trigger_delay,
-            "samp count" : samp_ct,
+            "trigger delay": ard_mon.trigger_holdoff,
+            "samp count" : ard_mon.samp_ct,
+            "dac start val" : ard_mon.dac_start_val,
+            "dac min val" : ard_mon.dac_min_val,
+            "long memory N std thresh" : ard_mon.long_mem_n_stdev,
+            "short memory N std thresh" : ard_mon.short_mem_n_stdev,
+            "short memory length" : ard_mon.short_mem_len,
+            
         }
     except Exception as e:
         print(f'Arduino param retrieval failed: {e}')
@@ -396,9 +525,8 @@ def set_lock_params(params: dict = Body(...)):
     
     try:
         device = dui_green if params['name'] == "green" else dui_blue
-        device.refresh_params(params['rms threshold'],
-                              params['window length'],
-                              params['fill fraction threshold'])
+        device.refresh_params(params['rms avg threshold'],
+                              params['window length'])
         
         #return {"status": "ok"}
     except Exception as e:
@@ -406,28 +534,40 @@ def set_lock_params(params: dict = Body(...)):
    
 
 @app.post("/refresh_arduino_params")
-def set_ard_params(params: dict = Body(...)):
-    ''' params format: { name: str(green / blue)
-                         window length: int
-                         rms threshold: float
-                         fill fraction threshold: float
-                        }
-    '''
-    
+def set_ard_params(params: dict = Body(...)):    
     try:
-        ard_mon.refresh_params(params['trigger delay'],
-                               params['samp count']
+        resp = ard_mon.refresh_params(params['trigger delay'],
+                               params['samp count'],
+                               params["dac start"],
+                               params["dac min"],
+                               params["long memory N std thresh"],
+                               params["short memory N std thresh"],
+                               params["short memory length"],
                                )
-        #return {"status": "ok"}
+        return {"dac start status": int(resp[0]),
+                "dac min status": int(resp[1]),
+                "dac abs min": int(resp[2]),
+                "dac abs max": int(resp[3])}
     except Exception as e:
         print(f"Arduino Parameter Refresh Failed: {e}")
         raise HTTPException(status_code=500, detail=f"Arduino Parameter Refresh Failed: {e}")
 
 
+@app.get("/initialize_arduino_stats")
+def initialize_arduino_stats():
+    try:
+        init_height, init_std = ard_mon.init_stats() # refreshes the ard_mon object's knowledge of all arduino onboard params
+        return {"init height": init_height,
+                "init std": init_std}
+    except Exception as e:
+        print(f'Arduino init stats failed: {e}')
+        raise HTTPException(status_code=500, detail=f'Arduino init stats failed: {e}')
+    
+
 if __name__ == '__main__':
     
-    dui_blue = DUIMonitor('Blue', "192.168.10.3", 60001, F_SAMP, WINDOW_LEN_B, RMS_THRESH_B, fill_frac_thresh=0.75)
-    dui_green = DUIMonitor('Green', "192.168.10.3", 60002, F_SAMP, WINDOW_LEN_G, RMS_THRESH_G, fill_frac_thresh=0.75)
+    dui_blue = DUIMonitor('Blue', "192.168.10.3", 60001, F_SAMP, WINDOW_LEN_B, RMS_THRESH_B)
+    dui_green = DUIMonitor('Green', "192.168.10.3", 60002, F_SAMP, WINDOW_LEN_G, RMS_THRESH_G)
     ard_mon = ArduinoMonitor('/dev/ttyACM0', 250000,
                              MOD_EN_PIN, LOCK_STATE_PIN,
                              MOD_ACTIVE_PIN, MOD_FAILURE_PIN, PEAKS_LOST_PIN) 
