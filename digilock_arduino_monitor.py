@@ -46,30 +46,30 @@ MOD_ACTIVE_PIN = 31
 MOD_EN_PIN = 33
 LOCK_STATE_PIN = 35
 
-ARD_INIT_STATS_TO = 10 # sec
+ARD_INIT_STATS_TO = 20 # sec
 N = 500 # arduino trace length
 
 
 glob_dict_lock = threading.Lock() # for different classes modifying the same dict 
 tcp_lock = threading.Lock() # for interfacing with the digilock RCI over using tcp
 serial_lock = threading.Lock() # for communitication over serial with the Arduino from in/out of a thread
-push_2dash_lock = threading.Lock() # for PUSHING to the dash from inside a thread
+push_2dash_lock = threading.Lock() # for PUSHING to the specific dash endpoint from inside a thread
 
 # shared state variables 
 GLOB_DICT = {        'blue happy': None,
                      'blue locked': None,
-                     'blue rms': None,
-                     'blue mean': None,
+                     'blue rms': 0.0,
+                     'blue mean': 0.0,
                      'green happy': None,
                      'green locked': None,
-                     'green rms': None,
-                     'green mean': None,
+                     'green rms': 0.0,
+                     'green mean': 0.0,
                      'ard peaks happy': None,
                      'ard fbk active' : None,
                      'ard fbk failed': None,
-                     'ard peaks mean': None,
-                     'ard peaks stdev': None,
-                     'ard dac': None
+                     'ard peaks mean': 0.0,
+                     'ard peaks stdev': 0.0,
+                     'ard dac': 0
                     }
 
 app = FastAPI() # pi's server
@@ -279,6 +279,7 @@ class ArduinoMonitor:
         self.long_mem_n_stdev = None
         self.short_mem_n_stdev = None
         self.short_mem_len = None
+        self.pk_fnd_thr = None
         
         self.query_params() # initializes params in group just above^
         
@@ -308,7 +309,7 @@ class ArduinoMonitor:
                 
                 #print(f"ARD GPIO (happy, active, failed): {self.peaks_happy}, {self.fbk_active}, {self.fbk_failed}")
                 
-                print(type(self.fbk_active), self.fbk_active)
+                #print(type(self.fbk_active), self.fbk_active)
                 
                 
                 with glob_dict_lock:
@@ -397,6 +398,7 @@ class ArduinoMonitor:
             self.long_mem_n_stdev = float(resp[4])
             self.short_mem_n_stdev = float(resp[5])
             self.short_mem_len = int(resp[6])
+            self.pk_fnd_thr = int(resp[7])
             
         except Exception as e:
             print(f'Failed to query arduino params {e}')
@@ -404,10 +406,11 @@ class ArduinoMonitor:
     
     
     def refresh_params(self, trigger_holdoff:int, samp_ct:int, dac_start:int, dac_min:int,
-                       long_mem_n_stdev:float, short_mem_n_stdev:float, short_mem_len:int):
+                       long_mem_n_stdev:float, short_mem_n_stdev:float, short_mem_len:int,
+                       pk_fnd_thr:int):
         try:
             with serial_lock:
-                self.ser.write(f'R{trigger_holdoff},{samp_ct},{dac_start},{dac_min},{long_mem_n_stdev},{short_mem_n_stdev},{short_mem_len}\n'.encode('ascii'))
+                self.ser.write(f'R{trigger_holdoff},{samp_ct},{dac_start},{dac_min},{long_mem_n_stdev},{short_mem_n_stdev},{short_mem_len},{pk_fnd_thr}\n'.encode('ascii'))
                 self.ser.flush()
                 resp = self.ser.readline()
             resp = resp.decode('ascii').rstrip().split(",")
@@ -421,7 +424,8 @@ class ArduinoMonitor:
             self.long_mem_n_stdev = long_mem_n_stdev
             self.short_mem_n_stdev = short_mem_n_stdev
             self.short_mem_len = short_mem_len
-        
+            self.pk_fnd_thr = pk_fnd_thr
+            
             return resp
         except Exception as e:
             print(f'Failed to Set Arduino Params: {e}')
@@ -491,6 +495,15 @@ def set_ard_fbk_en(setting: bool = Body(...)):
         raise HTTPException(status_code=500, detail=f'Arduino FB set failed: {e}')
 
 
+@app.get('/get_ard_fbk_en')
+def init_arduino_params():
+    try:
+        return {"fbk enabled": bool(ard_mon.fbk_en)}
+    except Exception as e:
+        print(f'Arduino FB EN state query failed: {e}')
+        raise HTTPException(status_code=500, detail=f'Arduino FB EN state query failed: {e}')
+
+
 @app.get('/init_arduino_params')
 def init_arduino_params():
     try:
@@ -503,6 +516,7 @@ def init_arduino_params():
             "long memory N std thresh" : ard_mon.long_mem_n_stdev,
             "short memory N std thresh" : ard_mon.short_mem_n_stdev,
             "short memory length" : ard_mon.short_mem_len,
+            "peakfind thresh" : ard_mon.pk_fnd_thr,
             
         }
     except Exception as e:
@@ -520,6 +534,7 @@ def set_ard_params(params: dict = Body(...)):
                                params["long memory N std thresh"],
                                params["short memory N std thresh"],
                                params["short memory length"],
+                               params["peakfind thresh"],
                                )
         return {"dac start status": int(resp[0]),
                 "dac min status": int(resp[1]),
@@ -557,7 +572,7 @@ def get_state_push_dash():
         ard_mon.get_ard_log_info()
         
         with push_2dash_lock:
-            requests.post(f"{DASH_URL}/api/master_pi_state_report", json=GLOB_DICT, timeout=2) # don't need a dict lock here cause reads are safe, also avoids potential deadlock bug
+            requests.post(f"{DASH_URL}/api/master_pi_state_report", json=GLOB_DICT, timeout=1) # don't need a dict lock here cause reads are safe, also avoids potential deadlock bug
         
         print(f'pushed to dash!')
     except Exception as e:
